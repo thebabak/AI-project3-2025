@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import os, json, time, shutil, warnings
 from zipfile import ZipFile
-from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -24,10 +23,8 @@ except Exception:
 def autocast_ctx(device: torch.device):
     """Return a correct autocast context that works for both PT1.x and PT2.x."""
     if AMP_IS_V2:
-        # torch.amp.autocast requires device_type argument in PT2.x
         return autocast_amp(device_type=device.type, enabled=(device.type != "cpu"))
     else:
-        # torch.cuda.amp.autocast uses 'enabled' only
         return autocast_amp(enabled=torch.cuda.is_available())
 
 def make_scaler(device: torch.device):
@@ -40,7 +37,7 @@ from tqdm import tqdm
 import open_clip
 from torch.multiprocessing import freeze_support
 
-# PEFT / LoRA
+# ---- PEFT / LoRA ----
 from peft import LoraConfig, get_peft_model, TaskType
 
 # ------------------------------
@@ -248,12 +245,15 @@ class LoRAClipBothEncoders(nn.Module):
         txt_t = discover_lora_targets(self.text_encoder)
         print(f"[LoRA] Visual targets: {vis_t}")
         print(f"[LoRA] Text targets  : {txt_t}")
-        vis_cfg = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION,
+
+        # IMPORTANT FIX: use TaskType.OTHER so PEFT does not inject 'input_ids'
+        vis_cfg = LoraConfig(task_type=TaskType.OTHER,
                              r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
                              target_modules=vis_t)
-        txt_cfg = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION,
+        txt_cfg = LoraConfig(task_type=TaskType.OTHER,
                              r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
                              target_modules=txt_t)
+
         self.visual = get_peft_model(self.visual, vis_cfg)
         self.text_encoder = get_peft_model(self.text_encoder, txt_cfg)
 
@@ -343,7 +343,7 @@ def plot_confusion_matrix(cm, subcats, model_type, fold, epoch, split_type="Vali
 def analyze_misclassifications(cm, subcats, model_type, fold, epoch, split_type="Validation"):
     n = cm.shape[0]; rows = []
     for t in range(n):
-        tot = np.sum(cm[t]);
+        tot = np.sum(cm[t])
         if tot == 0: continue
         for p in range(n):
             if t != p and cm[t][p] > 0:
@@ -753,9 +753,10 @@ if __name__ == "__main__":
 
         # 5) LoRA FT
         if "lora" not in checkpoint["completed_approaches"][str(fold)]:
-            print("\n[5/5] LoRA Adapters (both encoders)")
+            print("\n[5/5] LoRA Adapters (both encoders) ...")
             start=time.time()
-            model = LoRAClipBothEncoders(clip_model, subcategories, device, lora_r=8, lora_alpha=16, lora_dropout=0.05).to(device)
+            model = LoRAClipBothEncoders(clip_model, subcategories, device,
+                                         lora_r=8, lora_alpha=16, lora_dropout=0.05).to(device)
             crit = nn.CrossEntropyLoss(weight=class_weights)
             params = [p for p in model.parameters() if p.requires_grad]
             opt  = optim.AdamW(params, lr=2e-4)
