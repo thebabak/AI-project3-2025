@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
-# ---- AMP compatibility ----
+# ---- AMP compatibility (PyTorch 1.x & 2.x) ----
 try:
     from torch.amp import GradScaler as GradScalerAmp, autocast as autocast_amp  # PyTorch 2.x
     AMP_IS_V2 = True
@@ -21,9 +21,12 @@ except Exception:
     AMP_IS_V2 = False
 
 def autocast_ctx(device: torch.device):
+    """Return a correct autocast context that works for both PT1.x and PT2.x."""
     if AMP_IS_V2:
+        # torch.amp.autocast requires device_type in PT2.x
         return autocast_amp(device_type=device.type, enabled=(device.type != "cpu"))
     else:
+        # torch.cuda.amp.autocast uses 'enabled' only
         return autocast_amp(enabled=torch.cuda.is_available())
 
 def make_scaler(device: torch.device):
@@ -35,9 +38,6 @@ from datasets import load_dataset
 from tqdm import tqdm
 import open_clip
 from torch.multiprocessing import freeze_support
-
-# ======= NEW: Hugging Face PEFT (LoRA) =======
-from peft import LoraConfig, get_peft_model, TaskType
 
 # ------------------------------
 # Output dirs
@@ -208,35 +208,76 @@ class PartialFineTunedCLIP(nn.Module):
         return self.classifier(image_features)
 
 # ------------------------------
-# PEFT LoRA for CLIP encoders
+# Custom LoRA (no PEFT needed)
 # ------------------------------
-def list_linear_module_names(module: nn.Module):
-    """Return full qualified names of all nn.Linear modules under `module`."""
-    names = []
-    for name, sub in module.named_modules():
-        if isinstance(sub, nn.Linear):
-            names.append(name)
-    return names
+class LoRALinear(nn.Module):
+    """
+    Drop-in LoRA wrapper for nn.Linear:
+      y = x W^T + scale * (x (B^T A^T))   where A: in->r, B: r->out
+    Base Linear weight is frozen; only LoRA A/B are trainable.
+    """
+    def __init__(self, linear: nn.Linear, r=8, alpha=16, dropout=0.05):
+        super().__init__()
+        assert isinstance(linear, nn.Linear)
+        self.in_features  = linear.in_features
+        self.out_features = linear.out_features
+        self.r = r
+        self.scale = alpha / r
+        self.dropout = nn.Dropout(p=dropout) if dropout and dropout > 0 else nn.Identity()
 
-def choose_lora_targets(all_linear_names, prefer_keywords=("qkv","q_proj","k_proj","v_proj","out_proj","proj","fc1","fc2","in_proj","mlp","attn")):
+        # Frozen original layer
+        self.weight = nn.Parameter(linear.weight.data.clone(), requires_grad=False)
+        self.bias   = None
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.data.clone(), requires_grad=False)
+
+        # LoRA A and B
+        self.lora_A = nn.Linear(self.in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, self.out_features, bias=False)
+
+        # Init as in LoRA: B zeros, A small random
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=np.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x):
+        base = torch.nn.functional.linear(x, self.weight, self.bias)
+        x_d = self.dropout(x)
+        lora = self.lora_B(self.lora_A(x_d)) * self.scale
+        return base + lora
+
+def inject_lora_modules(root: nn.Module, target_substrings, r=8, alpha=16, dropout=0.05):
     """
-    Choose exact Linear module names to receive LoRA.
-    Preference: names containing common transformer/MLP keywords.
-    Fallback: all Linear layer names.
+    Recursively replace nn.Linear modules whose names contain any of the substrings
+    with LoRALinear wrappers. Operates in-place.
     """
-    lowers = [n.lower() for n in all_linear_names]
-    chosen = []
-    for i, name in enumerate(all_linear_names):
-        ln = lowers[i]
-        if any(k in ln for k in prefer_keywords):
-            chosen.append(name)
-    if not chosen:
-        chosen = all_linear_names[:]  # fallback: every Linear gets LoRA
-    return sorted(set(chosen))
+    for name, module in list(root.named_children()):
+        full = module
+        if isinstance(full, nn.Linear) and any(s in name.lower() for s in target_substrings):
+            setattr(root, name, LoRALinear(full, r=r, alpha=alpha, dropout=dropout))
+        else:
+            inject_lora_modules(full, target_substrings, r=r, alpha=alpha, dropout=dropout)
+
+def discover_lora_targets(model, prefer=("qkv","q_proj","k_proj","v_proj","out_proj","proj","fc1","fc2","in_proj","mlp","attn")):
+    """
+    Heuristic: find Linear submodule names that include common transformer/MLP names.
+    Falls back to "" (match-all) if none are found.
+    """
+    linear_names = []
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            linear_names.append(name)
+
+    lowers = [n.lower() for n in linear_names]
+    chosen = set()
+    for cand in prefer:
+        c = cand.lower()
+        if any(c in n for n in lowers):
+            chosen.add(c)
+    return sorted(chosen)
 
 class LoRAClipBothEncoders(nn.Module):
     """
-    Apply PEFT LoRA adapters to BOTH encoders (vision + text) using exact Linear names.
+    Apply custom LoRA to BOTH encoders (vision + text) for discovered Linear layers.
     """
     def __init__(self, base_model, subcategories, device, lora_r=8, lora_alpha=16, lora_dropout=0.05):
         super().__init__()
@@ -244,7 +285,7 @@ class LoRAClipBothEncoders(nn.Module):
         self.device = device
         self.tokenizer = open_clip.get_tokenizer("ViT-B-32")
 
-        # Expose CLIP parts
+        # Expose CLIP components
         self.visual = base_model.visual
         self.text_encoder = base_model.transformer
         self.token_embedding      = base_model.token_embedding
@@ -252,31 +293,24 @@ class LoRAClipBothEncoders(nn.Module):
         self.ln_final             = base_model.ln_final
         self.text_projection      = base_model.text_projection
 
-        # Find exact Linear names
-        vis_linear = list_linear_module_names(self.visual)
-        txt_linear = list_linear_module_names(self.text_encoder)
-        vis_targets = choose_lora_targets(vis_linear)
-        txt_targets = choose_lora_targets(txt_linear)
+        # Pick targets (fallback to match-all if none discovered)
+        vis_targets = discover_lora_targets(self.visual)
+        txt_targets = discover_lora_targets(self.text_encoder)
+        if not vis_targets: vis_targets = [""]
+        if not txt_targets: txt_targets = [""]
 
-        print(f"[PEFT-LoRA] Visual Linear layers: {len(vis_linear)}; targeting: {len(vis_targets)}")
-        print(f"[PEFT-LoRA] Text   Linear layers: {len(txt_linear)}; targeting: {len(txt_targets)}")
+        print(f"[LoRA] Visual targets  substrings: {vis_targets}")
+        print(f"[LoRA] Text targets    substrings: {txt_targets}")
 
-        vis_cfg = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
-            r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
-            target_modules=vis_targets
-        )
-        txt_cfg = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
-            r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
-            target_modules=txt_targets
-        )
+        # Inject LoRA in-place
+        inject_lora_modules(self.visual, vis_targets, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+        inject_lora_modules(self.text_encoder, txt_targets, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
 
-        # Wrap submodules with PEFT LoRA
-        self.visual = get_peft_model(self.visual, vis_cfg)
-        self.text_encoder = get_peft_model(self.text_encoder, txt_cfg)
-
-        # By default, PEFT freezes base params and enables only LoRA params (good!)
+        # Freeze original (non-LoRA) weights
+        for n, p in self.visual.named_parameters():
+            if "lora_" not in n: p.requires_grad = False
+        for n, p in self.text_encoder.named_parameters():
+            if "lora_" not in n: p.requires_grad = False
 
     @torch.no_grad()
     def encode_text(self, token_ids):
@@ -494,8 +528,7 @@ def train_model(model, train_loader, val_loader, test_loader, criterion, optimiz
 # ------------------------------
 # Fold plots
 # ------------------------------
-def save_png(fig_name):
-    save_png_current_figure(fig_name)
+def save_png(fig_name): save_png_current_figure(fig_name)
 
 def plot_fold_metrics(metrics, title_suffix=""):
     def g(k): return metrics.get(k, [])
@@ -503,16 +536,16 @@ def plot_fold_metrics(metrics, title_suffix=""):
     if not L: return
     n = min(L); folds = range(1, n+1)
     plt.figure(figsize=(14,10))
-    plt.subplot(2,2,1)
+    plt.subplot(2,2,1);
     if len(g("val_loss"))>0: plt.plot(folds[:len(g("val_loss"))], g("val_loss"), marker="o", label="Val Loss")
     plt.xlabel("Fold"); plt.ylabel("Loss"); plt.title(f"Validation Loss — {title_suffix}"); plt.legend()
-    plt.subplot(2,2,2)
+    plt.subplot(2,2,2);
     if len(g("test_loss"))>0: plt.plot(folds[:len(g("test_loss"))], g("test_loss"), marker="o", label="Test Loss")
     plt.xlabel("Fold"); plt.ylabel("Loss"); plt.title(f"Test Loss — {title_suffix}"); plt.legend()
-    plt.subplot(2,2,3)
+    plt.subplot(2,2,3);
     if len(g("val_acc"))>0: plt.plot(folds[:len(g("val_acc"))], g("val_acc"), marker="o", label="Val Acc")
     plt.xlabel("Fold"); plt.ylabel("Accuracy"); plt.title(f"Validation Accuracy — {title_suffix}"); plt.legend()
-    plt.subplot(2,2,4)
+    plt.subplot(2,2,4);
     if len(g("test_acc"))>0: plt.plot(folds[:len(g("test_acc"))], g("test_acc"), marker="o", label="Test Acc")
     plt.xlabel("Fold"); plt.ylabel("Accuracy"); plt.title(f"Test Accuracy — {title_suffix}"); plt.legend()
     save_png(f"fold_metrics_{title_suffix.replace(' ', '_')}.png")
@@ -546,7 +579,7 @@ def plot_full_vs_partial_vs_lora(full_m, partial_m, lora_m, k_folds):
         plt.subplot(2,2,i)
         plt.plot(folds[:len(s(full_m,key))],    s(full_m,key),    marker="o", label="Full FT")
         plt.plot(folds[:len(s(partial_m,key))], s(partial_m,key), marker="d", label="Partial FT (last 30%)")
-        plt.plot(folds[:len(s(lora_m,key))],    s(lora_m,key),    marker="^", label="LoRA (PEFT)")
+        plt.plot(folds[:len(s(lora_m,key))],    s(lora_m,key),    marker="^", label="LoRA (both encoders)")
         plt.xlabel("Fold"); plt.ylabel(title); plt.title(f"Full vs Partial vs LoRA — {title}"); plt.legend()
     save_png("full_vs_partial_vs_lora.png")
 
@@ -563,19 +596,15 @@ def create_fold_comparison_table(full_m, text_m, vision_m, partial_m, lora_m, k_
             "Full Train Loss": get(full_m,"train_loss",i), "Full Train Acc": get(full_m,"train_acc",i),
             "Full Val Loss": get(full_m,"val_loss",i), "Full Val Acc": get(full_m,"val_acc",i),
             "Full Test Loss": get(full_m,"test_loss",i), "Full Test Acc": get(full_m,"test_acc",i),
-
             "Text Train Loss": get(text_m,"train_loss",i), "Text Train Acc": get(text_m,"train_acc",i),
             "Text Val Loss": get(text_m,"val_loss",i), "Text Val Acc": get(text_m,"val_acc",i),
             "Text Test Loss": get(text_m,"test_loss",i), "Text Test Acc": get(text_m,"test_acc",i),
-
             "Vision Train Loss": get(vision_m,"train_loss",i), "Vision Train Acc": get(vision_m,"train_acc",i),
             "Vision Val Loss": get(vision_m,"val_loss",i), "Vision Val Acc": get(vision_m,"val_acc",i),
             "Vision Test Loss": get(vision_m,"test_loss",i), "Vision Test Acc": get(vision_m,"test_acc",i),
-
             "Partial Train Loss": get(partial_m,"train_loss",i), "Partial Train Acc": get(partial_m,"train_acc",i),
             "Partial Val Loss": get(partial_m,"val_loss",i), "Partial Val Acc": get(partial_m,"val_acc",i),
             "Partial Test Loss": get(partial_m,"test_loss",i), "Partial Test Acc": get(partial_m,"test_acc",i),
-
             "LoRA Train Loss": get(lora_m,"train_loss",i), "LoRA Train Acc": get(lora_m,"train_acc",i),
             "LoRA Val Loss": get(lora_m,"val_loss",i), "LoRA Val Acc": get(lora_m,"val_acc",i),
             "LoRA Test Loss": get(lora_m,"test_loss",i), "LoRA Test Acc": get(lora_m,"test_acc",i),
@@ -587,19 +616,15 @@ def create_fold_comparison_table(full_m, text_m, vision_m, partial_m, lora_m, k_
         "Full Train Loss":avg(full_m,"train_loss"), "Full Train Acc":avg(full_m,"train_acc"),
         "Full Val Loss":avg(full_m,"val_loss"), "Full Val Acc":avg(full_m,"val_acc"),
         "Full Test Loss":avg(full_m,"test_loss"), "Full Test Acc":avg(full_m,"test_acc"),
-
         "Text Train Loss":avg(text_m,"train_loss"), "Text Train Acc":avg(text_m,"train_acc"),
         "Text Val Loss":avg(text_m,"val_loss"), "Text Val Acc":avg(text_m,"val_acc"),
         "Text Test Loss":avg(text_m,"test_loss"), "Text Test Acc":avg(text_m,"test_acc"),
-
         "Vision Train Loss":avg(vision_m,"train_loss"), "Vision Train Acc":avg(vision_m,"train_acc"),
         "Vision Val Loss":avg(vision_m,"val_loss"), "Vision Val Acc":avg(vision_m,"val_acc"),
         "Vision Test Loss":avg(vision_m,"test_loss"), "Vision Test Acc":avg(vision_m,"test_acc"),
-
         "Partial Train Loss":avg(partial_m,"train_loss"), "Partial Train Acc":avg(partial_m,"train_acc"),
         "Partial Val Loss":avg(partial_m,"val_loss"), "Partial Val Acc":avg(partial_m,"val_acc"),
         "Partial Test Loss":avg(partial_m,"test_loss"), "Partial Test Acc":avg(partial_m,"test_acc"),
-
         "LoRA Train Loss":avg(lora_m,"train_loss"), "LoRA Train Acc":avg(lora_m,"train_acc"),
         "LoRA Val Loss":avg(lora_m,"val_loss"), "LoRA Val Acc":avg(lora_m,"val_acc"),
         "LoRA Test Loss":avg(lora_m,"test_loss"), "LoRA Test Acc":avg(lora_m,"test_acc"),
@@ -635,7 +660,7 @@ if __name__ == "__main__":
     lora_fold   = init_fold_metrics()
 
     timing = {"Full Fine-Tuning":[], "Text Encoder Fine-Tuning":[],
-              "Vision-Only Fine-Tuning":[], "Partial Fine-Tuning":[], "PEFT LoRA":[]}
+              "Vision-Only Fine-Tuning":[], "Partial Fine-Tuning":[], "LoRA Adapters":[]}
 
     ckpt_path = os.path.join(BASE_DIR, "checkpoint.json")
     checkpoint = {"current_fold": 0, "completed_approaches": {}}
@@ -783,37 +808,37 @@ if __name__ == "__main__":
             checkpoint["current_fold"]=fold; checkpoint["partial_fold"]=partial_fold; checkpoint["timing"]=timing
             with open(ckpt_path,"w") as f: json.dump(checkpoint,f)
 
-        # 5) PEFT LoRA (both encoders)
+        # 5) LoRA (custom, both encoders)
         if "lora" not in checkpoint["completed_approaches"][str(fold)]:
-            print("\n[5/5] PEFT LoRA (both encoders)")
+            print("\n[5/5] LoRA Adapters (custom; both encoders) ...")
             start=time.time()
             model = LoRAClipBothEncoders(clip_model, subcategories, device,
                                          lora_r=8, lora_alpha=16, lora_dropout=0.05).to(device)
             crit = nn.CrossEntropyLoss(weight=class_weights)
-            params = [p for p in model.parameters() if p.requires_grad]  # only LoRA params train
+            params = [p for p in model.parameters() if p.requires_grad]  # only LoRA params
             opt  = optim.AdamW(params, lr=2e-4)
             log_dir = os.path.join(BASE_DIR, "raw_lora_finetune_fold", f"{fold+1}")
             met = train_model(model, train_loader, val_loader, test_loader, crit, opt, 4,
-                              subcategories, device, log_dir, fold+1, 4, 2, "PEFT LoRA")
-            best = os.path.join(BEST_DIR, f"best_peft_lora_fold{fold+1}.pth")
+                              subcategories, device, log_dir, fold+1, 4, 2, "LoRA Adapters")
+            best = os.path.join(BEST_DIR, f"best_lora_adapters_fold{fold+1}.pth")
             if os.path.exists(best): model.load_state_dict(torch.load(best, map_location=device))
             v = evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, 999,
-                                            "PEFT LoRA","Validation")
+                                            "LoRA Adapters","Validation")
             t = evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, 999,
-                                            "PEFT LoRA","Test")
+                                            "LoRA Adapters","Test")
             lora_fold["train_loss"].append(met["train_loss"][-1] if met["train_loss"] else 0)
             lora_fold["train_acc"].append(met["train_acc"][-1] if met["train_acc"] else 0)
             lora_fold["val_loss"].append(v[0]); lora_fold["val_acc"].append(v[1])
             lora_fold["test_loss"].append(t[0]); lora_fold["test_acc"].append(t[1])
             lora_fold["precision"].append(v[2]); lora_fold["recall"].append(v[3]); lora_fold["f1"].append(v[4])
             save_logs_as_zip(log_dir, f"lora_finetune_fold_{fold+1}_logs")
-            timing["PEFT LoRA"].append(time.time()-start)
+            timing["LoRA Adapters"].append(time.time()-start)
             checkpoint["completed_approaches"][str(fold)].append("lora")
             checkpoint["current_fold"]=fold; checkpoint["lora_fold"]=lora_fold; checkpoint["timing"]=timing
             with open(ckpt_path,"w") as f: json.dump(checkpoint,f)
 
     print("\nLengths before plotting:")
-    for name,d in [("Full",full_fold),("Text",text_fold),("Vision",vision_fold),("Partial",partial_fold),("PEFT LoRA",lora_fold)]:
+    for name,d in [("Full",full_fold),("Text",text_fold),("Vision",vision_fold),("Partial",partial_fold),("LoRA",lora_fold)]:
         print(name,{k:len(v) for k,v in d.items()})
 
     # Per-approach plots
@@ -823,7 +848,7 @@ if __name__ == "__main__":
     plot_fold_wrapper("Text Encoder Fine-Tuning", text_fold)
     plot_fold_wrapper("Vision-Only Fine-Tuning",  vision_fold)
     plot_fold_wrapper("Partial Fine-Tuning",      partial_fold)
-    plot_fold_wrapper("PEFT LoRA",                lora_fold)
+    plot_fold_wrapper("LoRA Adapters",            lora_fold)
 
     # Comparisons
     compare_metrics(full_fold, text_fold, vision_fold, partial_fold, lora_fold, k_folds)
@@ -835,7 +860,7 @@ if __name__ == "__main__":
     dump("kfold_text_encoder_metrics",     text_fold)
     dump("kfold_vision_only_metrics",      vision_fold)
     dump("kfold_partial_finetune_metrics", partial_fold)
-    dump("kfold_peft_lora_metrics",        lora_fold)
+    dump("kfold_lora_adapters_metrics",    lora_fold)
 
     create_fold_comparison_table(full_fold, text_fold, vision_fold, partial_fold, lora_fold, k_folds)
 
