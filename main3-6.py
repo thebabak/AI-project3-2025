@@ -1,0 +1,1291 @@
+# -*- coding: utf-8 -*-
+import os, json, time, shutil, warnings
+from zipfile import ZipFile
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from torch.utils.tensorboard import SummaryWriter
+from torch.nn.utils import clip_grad_value_
+
+# ---- AMP compatibility (PyTorch 1.x & 2.x) ----
+try:
+    from torch.amp import GradScaler as GradScalerAmp, autocast as autocast_amp  # PyTorch 2.x
+    AMP_IS_V2 = True
+except Exception:
+    from torch.cuda.amp import GradScaler as GradScalerAmp, autocast as autocast_amp  # PyTorch 1.x
+    AMP_IS_V2 = False
+
+def autocast_ctx(device: torch.device):
+    if AMP_IS_V2:
+        return autocast_amp(device_type=device.type, enabled=(device.type != "cpu"))
+    else:
+        return autocast_amp(enabled=torch.cuda.is_available())
+
+def make_scaler(device: torch.device):
+    return GradScalerAmp(enabled=(device.type == "cuda"))
+
+from sklearn.model_selection import KFold
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, accuracy_score
+from datasets import load_dataset
+from tqdm import tqdm
+import open_clip
+from torch.multiprocessing import freeze_support
+
+# >>> Hugging Face transformers + PEFT
+from transformers import CLIPModel, CLIPProcessor
+from peft import LoraConfig, get_peft_model, TaskType
+# <<<
+
+# ------------------------------
+# Output dirs
+# ------------------------------
+BASE_DIR = os.path.join("logs", "main3-6")
+PNG_DIR  = os.path.join(BASE_DIR, "png")
+CSV_DIR  = os.path.join(BASE_DIR, "csv")
+BEST_DIR = os.path.join(BASE_DIR, "best")
+for d in [PNG_DIR, CSV_DIR, BEST_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+warnings.filterwarnings("ignore", message="These pretrained weights were trained with QuickGELU activation")
+warnings.filterwarnings("ignore", message="Repo card metadata block was not found")
+
+# Tag used for the final evaluation calls after training
+FINAL_EPOCH_TAG = 999
+
+# ------------------------------
+# Dataset
+# ------------------------------
+class FashionDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, subcategories, augment=False):
+        self.dataset = dataset
+        self.subcategories = subcategories
+        self.augment = augment
+        self.transform = self._get_transforms()
+
+    def _get_transforms(self):
+        from torchvision import transforms
+        if self.augment:
+            return transforms.Compose([
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(10),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            return transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])
+
+    def __len__(self): return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        image = item['image'].convert('RGB')
+        label = self.subcategories.index(item['subCategory'])
+        image = self.transform(image)  # CPU tensor
+        return image, label
+
+# Raw-PIL dataset for HF CLIP + CLIPProcessor
+class FashionRawPILDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, subcategories):
+        self.dataset = dataset
+        self.subcategories = subcategories
+    def __len__(self): return len(self.dataset)
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        image = item["image"].convert("RGB")
+        label = self.subcategories.index(item["subCategory"])
+        return image, label
+
+# Windows-safe, picklable collate for HF CLIP
+class CollateCLIP:
+    """Return CPU tensors (pin_memory works); training loop moves to device."""
+    def __init__(self, processor: CLIPProcessor):
+        self.processor = processor
+    def __call__(self, batch):
+        images, labels = zip(*batch)
+        enc = self.processor(images=list(images), return_tensors="pt")
+        pixel_values = enc["pixel_values"]                # CPU
+        labels = torch.tensor(labels, dtype=torch.long)   # CPU
+        return pixel_values, labels
+
+# ------------------------------
+# OpenCLIP baselines
+# ------------------------------
+class FullFineTunedCLIP(nn.Module):
+    def __init__(self, base_model, num_classes, num_layers=1, freeze_encoder=False):
+        super().__init__()
+        self.visual_encoder = base_model.visual
+        if freeze_encoder:
+            for p in self.visual_encoder.parameters(): p.requires_grad = False
+        device = next(base_model.parameters()).device
+        dummy = torch.randn(1, 3, 224, 224, device=device)
+        with torch.no_grad():
+            out_dim = self.visual_encoder(dummy).shape[1]
+        layers, in_dim = [], out_dim
+        for _ in range(num_layers - 1):
+            layers += [nn.Linear(in_dim, 512), nn.ReLU(), nn.Dropout(0.5)]
+            in_dim = 512
+        layers += [nn.Linear(in_dim, num_classes)]
+        self.classifier = nn.Sequential(*layers)
+    def forward(self, images, text_inputs=None):
+        feats = self.visual_encoder(images)
+        return self.classifier(feats)
+
+class TextEncoderFineTunedCLIP(nn.Module):
+    def __init__(self, base_model, subcategories, device, freeze_visual=True):
+        super().__init__()
+        self.visual_encoder = base_model.visual
+        self.text_encoder   = base_model.transformer
+        self.tokenizer      = open_clip.get_tokenizer("ViT-B-32")
+        self.device         = device
+        self.subcategories  = subcategories
+        if freeze_visual:
+            for p in self.visual_encoder.parameters(): p.requires_grad = False
+        self.text_projection      = base_model.text_projection
+        self.positional_embedding = base_model.positional_embedding
+        self.ln_final             = base_model.ln_final
+        self.token_embedding      = base_model.token_embedding
+    def encode_text(self, token_ids):
+        x = self.token_embedding(token_ids); x = x + self.positional_embedding
+        x = x.permute(1, 0, 2); x = self.text_encoder(x); x = x.permute(1, 0, 2)
+        x = self.ln_final(x)
+        x = x[torch.arange(x.shape[0]), token_ids.argmax(dim=-1)] @ self.text_projection
+        return x
+    def forward(self, images, text_inputs=None):
+        image_features = self.visual_encoder(images)
+        if text_inputs is None:
+            text_inputs = self.tokenizer([f"a photo of {c}" for c in self.subcategories]).to(self.device)
+        text_features = self.encode_text(text_inputs)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features  = text_features  / text_features.norm(dim=-1, keepdim=True)
+        return (image_features @ text_features.T) * 100.0
+
+class VisionOnlyFineTunedCLIP(nn.Module):
+    def __init__(self, base_model, num_classes, num_layers=1):
+        super().__init__()
+        self.visual_encoder = base_model.visual
+        for p in self.visual_encoder.parameters(): p.requires_grad = True
+        device = next(base_model.parameters()).device
+        dummy = torch.randn(1, 3, 224, 224, device=device)
+        with torch.no_grad():
+            out_dim = self.visual_encoder(dummy).shape[1]
+        layers, in_dim = [], out_dim
+        for _ in range(num_layers - 1):
+            layers += [nn.Linear(in_dim, 512), nn.ReLU(), nn.Dropout(0.5)]
+            in_dim = 512
+        layers += [nn.Linear(in_dim, num_classes)]
+        self.classifier = nn.Sequential(*layers)
+    def forward(self, images, text_inputs=None):
+        feats = self.visual_encoder(images)
+        return self.classifier(feats)
+
+class PartialFineTunedCLIP(nn.Module):
+    def __init__(self, base_model, num_classes, freeze_percentage=0.7):
+        super().__init__()
+        self.visual_encoder = base_model.visual
+        self.text_encoder   = base_model.transformer
+        self.tokenizer      = open_clip.get_tokenizer("ViT-B-32")
+        self.device         = next(base_model.parameters()).device
+        dummy = torch.randn(1, 3, 224, 224, device=self.device)
+        with torch.no_grad():
+            out_dim = self.visual_encoder(dummy).shape[1]
+        self.classifier = nn.Linear(out_dim, num_classes)
+        self._freeze_layers(self.visual_encoder, freeze_percentage, "visual")
+        self._freeze_layers(self.text_encoder,   freeze_percentage, "text")
+        self.text_projection      = base_model.text_projection
+        self.positional_embedding = base_model.positional_embedding
+        self.ln_final             = base_model.ln_final
+        self.token_embedding      = base_model.token_embedding
+    def _freeze_layers(self, module, freeze_percentage, enc_name):
+        named_params = list(module.named_parameters())
+        total = len(named_params); cutoff = int(total * freeze_percentage)
+        print(f"Freezing first {freeze_percentage*100:.1f}% of {enc_name} ({cutoff}/{total} tensors)")
+        for i, (_, p) in enumerate(named_params):
+            p.requires_grad = i >= cutoff
+    def encode_text(self, token_ids):
+        x = self.token_embedding(token_ids); x = x + self.positional_embedding
+        x = x.permute(1, 0, 2); x = self.text_encoder(x); x = x.permute(1, 0, 2)
+        x = self.ln_final(x)
+        x = x[torch.arange(x.shape[0]), token_ids.argmax(dim=-1)] @ self.text_projection
+        return x
+    def forward(self, images, text_inputs=None):
+        image_features = self.visual_encoder(images)
+        if text_inputs is not None:
+            text_features = self.encode_text(text_inputs)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features  = text_features  / text_features.norm(dim=-1, keepdim=True)
+            return (image_features @ text_features.T) * 100.0
+        return self.classifier(image_features)
+
+# ------------------------------
+# Custom LoRA (OpenCLIP path)
+# ------------------------------
+class LoRALinear(nn.Module):
+    def __init__(self, linear: nn.Linear, r=8, alpha=16, dropout=0.05):
+        super().__init__()
+        assert isinstance(linear, nn.Linear)
+        self.in_features  = linear.in_features
+        self.out_features = linear.out_features
+        self.r = r
+        self.scale = alpha / r
+        self.dropout = nn.Dropout(p=dropout) if dropout and dropout > 0 else nn.Identity()
+        self.weight = nn.Parameter(linear.weight.data.clone(), requires_grad=False)
+        self.bias   = None
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.data.clone(), requires_grad=False)
+        self.lora_A = nn.Linear(self.in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, self.out_features, bias=False)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=np.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+    def forward(self, x):
+        base = torch.nn.functional.linear(x, self.weight, self.bias)
+        x_d = self.dropout(x)
+        lora = self.lora_B(self.lora_A(x_d)) * self.scale
+        return base + lora
+
+def inject_lora_modules(root: nn.Module, target_substrings, r=8, alpha=16, dropout=0.05):
+    for name, module in list(root.named_children()):
+        full = module
+        if isinstance(full, nn.Linear) and any(s in name.lower() for s in target_substrings):
+            setattr(root, name, LoRALinear(full, r=r, alpha=alpha, dropout=dropout))
+        else:
+            inject_lora_modules(full, target_substrings, r=r, alpha=alpha, dropout=dropout)
+
+def discover_lora_targets(model, prefer=("qkv","q_proj","k_proj","v_proj","out_proj","proj","fc1","fc2","in_proj","mlp","attn")):
+    linear_names = []
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            linear_names.append(name)
+    lowers = [n.lower() for n in linear_names]
+    chosen = set()
+    for cand in prefer:
+        c = cand.lower()
+        if any(c in n for n in lowers):
+            chosen.add(c)
+    return sorted(chosen)
+
+class LoRAClipBothEncoders(nn.Module):
+    def __init__(self, base_model, subcategories, device, lora_r=8, lora_alpha=16, lora_dropout=0.05):
+        super().__init__()
+        self.subcategories = subcategories
+        self.device = device
+        self.tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        self.visual = base_model.visual
+        self.text_encoder = base_model.transformer
+        self.token_embedding      = base_model.token_embedding
+        self.positional_embedding = base_model.positional_embedding
+        self.ln_final             = base_model.ln_final
+        self.text_projection      = base_model.text_projection
+        vis_targets = discover_lora_targets(self.visual) or [""]
+        txt_targets = discover_lora_targets(self.text_encoder) or [""]
+        print(f"[LoRA] Visual targets: {vis_targets}")
+        print(f"[LoRA] Text targets  : {txt_targets}")
+        inject_lora_modules(self.visual, vis_targets, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+        inject_lora_modules(self.text_encoder, txt_targets, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+        for n, p in self.visual.named_parameters():
+            if "lora_" not in n: p.requires_grad = False
+        for n, p in self.text_encoder.named_parameters():
+            if "lora_" not in n: p.requires_grad = False
+    @torch.no_grad()
+    def encode_text(self, token_ids):
+        x = self.token_embedding(token_ids); x = x + self.positional_embedding
+        x = x.permute(1, 0, 2); x = self.text_encoder(x); x = x.permute(1, 0, 2)
+        x = self.ln_final(x)
+        x = x[torch.arange(x.shape[0]), token_ids.argmax(dim=-1)] @ self.text_projection
+        return x
+    def forward(self, images, text_inputs=None):
+        image_features = self.visual(images)
+        if text_inputs is None:
+            text_inputs = self.tokenizer([f"a photo of {c}" for c in self.subcategories]).to(self.device)
+        text_features = self.encode_text(text_inputs)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features  = text_features  / text_features.norm(dim=-1, keepdim=True)
+        return (image_features @ text_features.T) * 100.0
+
+# ------------------------------
+# HF CLIP + PEFT (text LoRA; base vision; bypass PeftModel.forward)
+# ------------------------------
+class HfCLIPWithPEFT(nn.Module):
+    """
+    CLIP from transformers, LoRA via PEFT on the TEXT tower only by default.
+    We bypass the PeftModel.forward kwargs issue by calling .base_model(...) directly and
+    then pooling + projecting like transformers' CLIPModel.get_text_features.
+    """
+    def __init__(self, model_name, device, subcategories,
+                 lora_r=8, lora_alpha=16, lora_dropout=0.05,
+                 freeze_non_lora=True, lora_on_vision=False):
+        super().__init__()
+        self.clip = CLIPModel.from_pretrained(model_name)
+        self.processor = CLIPProcessor.from_pretrained(model_name)
+        self.subcategories = subcategories
+        self.device = device
+        self.clip = self.clip.to(device)
+
+        # expose tokenizer
+        self.tokenizer = self.processor.tokenizer
+        self.class_prompts = [f"a photo of {c}" for c in subcategories]
+
+        target_modules = ["q_proj","k_proj","v_proj","out_proj","fc1","fc2"]
+        cfg = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+            target_modules=target_modules
+        )
+
+        # LoRA on TEXT tower
+        self.clip.text_model = get_peft_model(self.clip.text_model, cfg)
+
+        # Optional: LoRA on VISION tower (off by default)
+        if lora_on_vision:
+            self.clip.vision_model = get_peft_model(self.clip.vision_model, cfg)
+
+        if freeze_non_lora:
+            for n, p in self.clip.named_parameters():
+                if "lora_" not in n:
+                    p.requires_grad = False
+
+    def _encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.clip.get_image_features(pixel_values=pixel_values)
+
+    def _encode_text_with_peft(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None,
+                               position_ids: torch.Tensor = None) -> torch.Tensor:
+        text_peft = self.clip.text_model
+        text_core = getattr(text_peft, "base_model", text_peft)  # CLIPTextModel/Transformer
+
+        outputs = text_core(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=False,
+            output_hidden_states=False
+        )
+        last_hidden_state = outputs.last_hidden_state  # (B, L, H)
+
+        # Pool at EOT token position (CLIP convention: argmax over token ids ≈ EOT position)
+        gather_idx = input_ids.argmax(dim=-1)
+        pooled = last_hidden_state[torch.arange(last_hidden_state.shape[0]), gather_idx]
+
+        text_features = self.clip.text_projection(pooled)
+        return text_features
+
+    def forward(self, images, text_inputs=None):
+        image_features = self._encode_images(images)
+
+        if text_inputs is None:
+            text_inputs = self.tokenizer(self.class_prompts, padding=True, return_tensors="pt")
+        allowed = {"input_ids", "attention_mask", "position_ids"}
+        text_inputs = {k: v.to(self.device) for k, v in text_inputs.items() if k in allowed}
+
+        text_features  = self._encode_text_with_peft(**text_inputs)
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features  = text_features  / text_features.norm(dim=-1, keepdim=True)
+        logit_scale = self.clip.logit_scale.exp()
+        return logit_scale * (image_features @ text_features.t())
+
+# ------------------------------
+# Fractional FT (1–5%) model with zero-clipping
+# ------------------------------
+class FractionalFT_VisionCLIP(nn.Module):
+    """
+    Train only ~1–5% of the vision tower (plus a small head).
+    """
+    def __init__(self, base_model, num_classes, min_frac=0.01, max_frac=0.05):
+        super().__init__()
+        self.visual = base_model.visual
+        with torch.no_grad():
+            dev = next(self.visual.parameters()).device
+            dummy = torch.randn(1,3,224,224, device=dev)
+            out_dim = self.visual(dummy).shape[1]
+        self.head = nn.Sequential(
+            nn.Linear(out_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        )
+        set_fraction_trainable(self.visual, min_frac=min_frac, max_frac=max_frac)
+        for p in self.head.parameters(): p.requires_grad = True
+    def forward(self, images, text_inputs=None):
+        feats = self.visual(images)
+        return self.head(feats)
+
+# ------------------------------
+# Utilities with zero-clipping support
+# ------------------------------
+def setup_environment():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    return device
+
+def load_clip_model(device, model_name="ViT-B-32", pretrained_weights="openai"):
+    model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained_weights)
+    model = model.to(device); model.eval()
+    return model, preprocess, preprocess
+
+def load_fashion_dataset():
+    dataset = load_dataset("ceyda/fashion-products-small")
+    train_data = dataset['train']
+    subcategories = sorted(set(item['subCategory'] for item in train_data))
+    print(f"Loaded dataset with {len(subcategories)} subcategories.")
+    return train_data, subcategories
+
+def compute_class_weights(dataset, subcategories):
+    labels = [subcategories.index(item['subCategory']) for item in dataset]
+    counts = np.bincount(labels, minlength=len(subcategories))
+    total = len(labels)
+    weights = total / (len(subcategories) * np.clip(counts, 1, None))
+    return torch.tensor(weights, dtype=torch.float)
+
+def save_csv(df_or_dict, filename):
+    out = os.path.join(CSV_DIR, filename); os.makedirs(os.path.dirname(out), exist_ok=True)
+    if isinstance(df_or_dict, pd.DataFrame):
+        df_or_dict.to_csv(out, index=False)
+    else:
+        pd.DataFrame(df_or_dict).to_csv(out, index=False)
+    print(f"CSV saved: {out}"); return out
+
+def save_png_current_figure(filename):
+    out = os.path.join(PNG_DIR, filename); os.makedirs(os.path.dirname(out), exist_ok=True)
+    plt.savefig(out, bbox_inches="tight"); plt.close()
+    print(f"PNG saved: {out}"); return out
+
+def save_logs_as_zip(log_dir, zip_stem, delete_after: bool = False):
+    """
+    Zip a log directory; by default keep it so TensorBoard can read it.
+    Set delete_after=True only when you want to archive & clean up.
+    """
+    if os.path.exists(log_dir):
+        zip_path = os.path.join(BASE_DIR, f"{zip_stem}.zip")
+        with ZipFile(zip_path, 'w') as zipf:
+            for root, _, files in os.walk(log_dir):
+                for file in files:
+                    src = os.path.join(root, file)
+                    arc = os.path.relpath(src, log_dir)
+                    zipf.write(src, arc)
+        print(f"Logs zipped: {zip_path}")
+        if delete_after:
+            shutil.rmtree(log_dir, ignore_errors=True)
+
+# ---- Param stats helpers (efficiency) ----
+def get_param_stats(model: nn.Module):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    pct = (trainable / total) if total else 0.0
+    return total, trainable, pct
+
+def log_param_stats_tb(writer: SummaryWriter, model_type: str, fold: int, model: nn.Module):
+    if writer is None: return
+    total, trainable, pct = get_param_stats(model)
+    tb_step = (fold - 1) * 1000  # meta step
+    writer.add_scalar(f"{model_type}/Meta/TotalParams", total, tb_step)
+    writer.add_scalar(f"{model_type}/Meta/TrainableParams", trainable, tb_step)
+    writer.add_scalar(f"{model_type}/Meta/TrainablePct", pct * 100.0, tb_step)
+
+# ------------------------------
+# Confusion / Misclass
+# ------------------------------
+def plot_confusion_matrix(cm, subcats, model_type, fold, epoch, split_type="Validation"):
+    n = cm.shape[0]
+    labels = subcats[:n] if n <= len(subcats) else [f"Class_{i}" for i in range(n)]
+    plt.figure(figsize=(15, 12))
+    sns.heatmap(cm, annot=False, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels)
+    plt.title(f'Confusion Matrix - {model_type} (Fold {fold}, Epoch {epoch}, {split_type})')
+    plt.xlabel('Predicted'); plt.ylabel('True')
+    plt.xticks(rotation=45, ha='right'); plt.yticks(rotation=0)
+    fname = f"{model_type.lower().replace(' ', '_')}_fold{fold}_epoch{epoch}_{split_type.lower()}_confmat.png"
+    save_png_current_figure(fname)
+
+def analyze_misclassifications(cm, subcats, model_type, fold, epoch, split_type="Validation"):
+    n = cm.shape[0]; rows = []
+    for t in range(n):
+        tot = np.sum(cm[t])
+        if tot == 0: continue
+        for p in range(n):
+            if t != p and cm[t][p] > 0:
+                cnt = cm[t][p]
+                rows.append({
+                    "True Class": subcats[t] if t < len(subcats) else f"Class_{t}",
+                    "Predicted Class": subcats[p] if p < len(subcats) else f"Class_{p}",
+                    "Count": cnt, "Percentage of True Class": 100.0 * cnt / tot
+                })
+    if rows:
+        df = pd.DataFrame(rows).sort_values("Count", ascending=False).head(10)
+        fname = f"{model_type.lower().replace(' ', '_')}_fold{fold}_epoch{epoch}_{split_type.lower()}_misclass.csv"
+        save_csv(df, fname)
+        return df
+    return None
+
+# ------------------------------
+# Text helper (OpenCLIP & HF)
+# ------------------------------
+def build_text_inputs(model, subcats, device):
+    if not hasattr(model, "tokenizer"):
+        return None
+    prompts = [f"a photo of {c}" for c in subcats]
+    tok = model.tokenizer
+    # HF tokenizer path
+    try:
+        enc = tok(prompts, padding=True, return_tensors="pt")
+        if isinstance(enc, dict):
+            allowed = {"input_ids", "attention_mask", "position_ids"}
+            enc = {k: v.to(device) for k, v in enc.items() if k in allowed}
+            return enc
+    except TypeError:
+        pass
+    # OpenCLIP tokenizer path
+    tokens = tok(prompts)
+    if isinstance(tokens, torch.Tensor):
+        return tokens.to(device)
+    return None
+
+# ------------------------------
+# Fractional FT (1–5%) helpers with zero-clipping
+# ------------------------------
+def count_params(module):
+    return sum(p.numel() for p in module.parameters())
+
+def count_trainable_params(module):
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+def set_fraction_trainable(
+    root: nn.Module,
+    min_frac=0.01,
+    max_frac=0.05,
+    prefer_types=(nn.Linear, nn.LayerNorm),
+    prefer_name_keywords=("proj","qkv","q_proj","k_proj","v_proj","out_proj","mlp","fc","attn","ln","norm"),
+    reverse=True
+):
+    # Freeze all
+    for p in root.parameters(): p.requires_grad = False
+    total = count_params(root)
+    target_min = int(np.ceil(total * min_frac))
+    target_max = int(np.floor(total * max_frac))
+
+    # Candidate leaf modules
+    cands = []
+    for name, mod in root.named_modules():
+        has_params = any(True for _ in mod.parameters(recurse=False))
+        if not has_params: continue
+        if any(isinstance(mod, t) for t in prefer_types):
+            kw_score = sum(k in name.lower() for k in prefer_name_keywords)
+            cands.append((name, mod, kw_score))
+
+    cands.sort(key=lambda x: (x[2], x[0]), reverse=True if reverse else False)
+
+    enabled = []
+    for name, mod, _ in cands:
+        for p in mod.parameters(recurse=False):
+            p.requires_grad = True
+        enabled.append(name)
+        if count_trainable_params(root) >= target_min:
+            break
+
+    while count_trainable_params(root) > target_max and enabled:
+        name = enabled.pop()
+        mod = dict(root.named_modules())[name]
+        for p in mod.parameters(recurse=False):
+            p.requires_grad = False
+
+    trainable = count_trainable_params(root)
+    print(f"[Fractional FT] Total: {total:,}  Trainable: {trainable:,}  ({100*trainable/total:.2f}% within [{min_frac*100:.1f}–{max_frac*100:.1f}]%)")
+    return trainable / max(total, 1)
+
+# ------------------------------
+# Eval & Train with zero-clipping and TensorBoard
+# ------------------------------
+def evaluate_model_with_metrics(model, loader, criterion, subcats, device, fold, epoch, model_type,
+                              split_type="Validation", writer: SummaryWriter = None):
+    model.eval()
+    tot_loss, all_preds, all_labels = 0.0, [], []
+    all_probs = []
+    texts = build_text_inputs(model, subcats, device)
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images, text_inputs=texts) if texts is not None else model(images)
+            loss = criterion(outputs, labels)
+            tot_loss += loss.item()
+            probs = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(probs, dim=1)
+            all_probs.append(probs.detach().cpu().numpy())
+            all_preds.extend(preds.detach().cpu().numpy())
+            all_labels.extend(labels.detach().cpu().numpy())
+
+    avg_loss = tot_loss / max(len(loader), 1)
+    acc = accuracy_score(all_labels, all_preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds,
+                                                             average='weighted', zero_division=0)
+    cm = confusion_matrix(all_labels, all_preds)
+
+    plot_confusion_matrix(cm, subcats, model_type, fold, epoch, split_type)
+    analyze_misclassifications(cm, subcats, model_type, fold, epoch, split_type)
+
+    if writer is not None:
+        tb_step = (fold - 1) * 1000 + epoch
+        fig_cm = plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=False, fmt='d', cmap='Blues',
+                    xticklabels=subcats[:cm.shape[1]],
+                    yticklabels=subcats[:cm.shape[0]])
+        plt.title(f'Confusion Matrix - {model_type} ({split_type})')
+        plt.xlabel('Predicted'); plt.ylabel('True')
+        writer.add_figure(f"{model_type}/{split_type}/ConfusionMatrix", fig_cm, global_step=tb_step)
+        plt.close(fig_cm)
+        writer.add_scalar(f"{model_type}/{split_type}/Loss", avg_loss, tb_step)
+        writer.add_scalar(f"{model_type}/{split_type}/Accuracy", acc, tb_step)
+        writer.add_scalar(f"{model_type}/{split_type}/Precision_w", precision, tb_step)
+        writer.add_scalar(f"{model_type}/{split_type}/Recall_w", recall, tb_step)
+        writer.add_scalar(f"{model_type}/{split_type}/F1_w", f1, tb_step)
+        try:
+            probs = np.concatenate(all_probs, axis=0)
+            y_true = np.array(all_labels)
+            num_classes = probs.shape[1]
+            max_classes_to_log = min(10, num_classes)
+            from sklearn.preprocessing import label_binarize
+            y_bin = label_binarize(y_true, classes=list(range(num_classes)))
+            for cls in range(max_classes_to_log):
+                writer.add_pr_curve(
+                    f"{model_type}/{split_type}/PR_{subcats[cls] if cls < len(subcats) else cls}",
+                    labels=y_bin[:, cls].astype(np.int32),
+                    predictions=probs[:, cls].astype(np.float32),
+                    global_step=tb_step
+                )
+        except Exception:
+            pass
+
+    print(f"{model_type} {split_type} (Fold {fold}, Epoch {epoch}): "
+          f"Loss={avg_loss:.4f}, Acc={acc:.4f}, Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
+    return avg_loss, acc, precision, recall, f1, cm
+
+def train_model_with_zero_clipping(model, train_loader, val_loader, test_loader, criterion, optimizer,
+                                 num_epochs, subcats, device, log_dir, fold,
+                                 accumulation_steps=4, validate_every=2, model_type="Model",
+                                 writer: SummaryWriter = None, clip_value=0.0):
+    """
+    Train model with zero-clipping (gradient clipping at zero) and TensorBoard logging
+    """
+    scaler = make_scaler(device)
+    best_f1, patience, patience_counter = 0.0, 3, 0
+    metrics = {"epoch": [], "train_loss": [], "train_acc": [],
+               "val_loss": [], "val_acc": [], "test_loss": [], "test_acc": [],
+               "precision_val": [], "recall_val": [], "f1_val": [],
+               "precision_test": [], "recall_test": [], "f1_test": []}
+
+    # Log param stats once per approach & fold
+    log_param_stats_tb(writer, model_type, fold, model)
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_train_loss, correct_train, total_train = 0.0, 0, 0
+        optimizer.zero_grad()
+        texts = build_text_inputs(model, subcats, device)
+
+        with tqdm(train_loader, desc=f"{model_type} | Epoch {epoch+1}/{num_epochs}", unit="batch") as pbar:
+            for bidx, (images, labels) in enumerate(pbar):
+                images, labels = images.to(device), labels.to(device)
+                with autocast_ctx(device):
+                    outputs = model(images, text_inputs=texts) if texts is not None else model(images)
+                    loss = criterion(outputs, labels) / accumulation_steps
+                scaler.scale(loss).backward()
+
+                if (bidx + 1) % accumulation_steps == 0:
+                    # Apply zero-clipping
+                    if clip_value > 0:
+                        clip_grad_value_(model.parameters(), clip_value=clip_value)
+                    
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    
+                    if writer is not None:
+                        tb_step = (fold - 1) * 1000 + (epoch + 1)
+                        # Log learning rates
+                        for i, pg in enumerate(optimizer.param_groups):
+                            writer.add_scalar(f"{model_type}/LR/group_{i}", pg.get("lr", 0.0), tb_step)
+                        
+                        # Log gradient norms
+                        try:
+                            total_norm = 0.0
+                            for p in model.parameters():
+                                if p.grad is not None:
+                                    param_norm = p.grad.data.norm(2)
+                                    total_norm += param_norm.item() ** 2
+                            total_norm = total_norm ** 0.5
+                            writer.add_scalar(f"{model_type}/GradNorm", total_norm, tb_step)
+                        except Exception:
+                            pass
+
+                total_train_loss += loss.item() * accumulation_steps
+                preds = torch.argmax(outputs, dim=1)
+                correct_train += (preds == labels).sum().item()
+                total_train += labels.size(0)
+                pbar.set_postfix({"loss": f"{(total_train_loss / (bidx+1)):.4f}",
+                                  "acc": f"{(correct_train / max(total_train,1)):.4f}"})
+
+        avg_train_loss = total_train_loss / max(len(train_loader), 1)
+        train_acc = correct_train / max(total_train, 1)
+
+        if writer is not None:
+            tb_step = (fold - 1) * 1000 + (epoch + 1)
+            writer.add_scalar(f"{model_type}/Train/Loss", avg_train_loss, tb_step)
+            writer.add_scalar(f"{model_type}/Train/Accuracy", train_acc, tb_step)
+
+        if (epoch + 1) % validate_every == 0 or epoch == num_epochs - 1:
+            v_loss, v_acc, v_p, v_r, v_f1, _ = evaluate_model_with_metrics(
+                model, val_loader, criterion, subcats, device, fold, epoch + 1, model_type, "Validation", writer=writer)
+            t_loss, t_acc, t_p, t_r, t_f1, _ = evaluate_model_with_metrics(
+                model, test_loader, criterion, subcats, device, fold, epoch + 1, model_type, "Test", writer=writer)
+
+            metrics["epoch"].append(epoch + 1)
+            metrics["train_loss"].append(avg_train_loss); metrics["train_acc"].append(train_acc)
+            metrics["val_loss"].append(v_loss); metrics["val_acc"].append(v_acc)
+            metrics["test_loss"].append(t_loss); metrics["test_acc"].append(t_acc)
+            metrics["precision_val"].append(v_p); metrics["recall_val"].append(v_r); metrics["f1_val"].append(v_f1)
+            metrics["precision_test"].append(t_p); metrics["recall_test"].append(t_r); metrics["f1_test"].append(t_f1)
+
+            if writer is not None:
+                tb_step = (fold - 1) * 1000 + (epoch + 1)
+                writer.add_scalar(f"{model_type}/Val/Summary_F1_w", v_f1, tb_step)
+                writer.add_scalar(f"{model_type}/Test/Summary_F1_w", t_f1, tb_step)
+
+            if v_f1 > best_f1:
+                best_f1 = v_f1; patience_counter = 0
+                best_path = os.path.join(BEST_DIR, f"best_{model_type.lower().replace(' ', '_')}_fold{fold}.pth")
+                torch.save(model.state_dict(), best_path)
+                print(f"Best model saved: {best_path} (Val F1={best_f1:.4f})")
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
+        else:
+            metrics["epoch"].append(epoch + 1)
+            metrics["train_loss"].append(avg_train_loss); metrics["train_acc"].append(train_acc)
+            metrics["val_loss"].append(0.0); metrics["val_acc"].append(0.0)
+            metrics["test_loss"].append(0.0); metrics["test_acc"].append(0.0)
+            metrics["precision_val"].append(0.0); metrics["recall_val"].append(0.0); metrics["f1_val"].append(0.0)
+            metrics["precision_test"].append(0.0); metrics["recall_test"].append(0.0); metrics["f1_test"].append(0.0)
+
+        print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f}")
+
+    save_csv(metrics, f"{model_type.lower().replace(' ', '_')}_fold{fold}_per_epoch.csv")
+    return metrics
+
+# ------------------------------
+# TensorBoard Comparison Utilities
+# ------------------------------
+def log_comparison_metrics(writer, approach_names, metrics_list, k_folds):
+    """Log comparison metrics across all approaches to TensorBoard"""
+    if writer is None:
+        return
+        
+    # Create a comparison figure for each metric
+    metrics_to_compare = ["val_loss", "val_acc", "test_loss", "test_acc", "f1"]
+    
+    for metric in metrics_to_compare:
+        fig = plt.figure(figsize=(10, 6))
+        for name, metrics in zip(approach_names, metrics_list):
+            values = metrics.get(metric, [])
+            if len(values) > 0:
+                plt.plot(range(1, len(values)+1), values, marker='o', label=name)
+        
+        plt.xlabel("Fold")
+        plt.ylabel(metric.replace("_", " ").title())
+        plt.title(f"Comparison of {metric.replace('_', ' ').title()} Across Approaches")
+        plt.legend()
+        plt.grid(True)
+        
+        writer.add_figure(f"Comparison/{metric}", fig)
+        plt.close(fig)
+
+def get_tensorboard_writer(base_dir, approach_name, fold):
+    """Create a TensorBoard writer with standardized naming"""
+    log_dir = os.path.join(base_dir, "tensorboard", approach_name.replace(" ", "_"), f"fold_{fold}")
+    os.makedirs(log_dir, exist_ok=True)
+    return SummaryWriter(log_dir=log_dir)
+
+# ------------------------------
+# Main with zero-clipping and TensorBoard
+# ------------------------------
+if __name__ == "__main__":
+    freeze_support()
+    overall_start = time.time()
+    print(f"\nStart: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_start))}")
+
+    device = setup_environment()
+    clip_model, _, _ = load_clip_model(device, "ViT-B-32", "openai")
+    dataset, subcategories = load_fashion_dataset()
+    class_weights = compute_class_weights(dataset, subcategories).to(device)
+
+    k_folds = 5
+    kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+
+    def init_fold_metrics():
+        return {"train_loss":[], "train_acc":[], "val_loss":[], "val_acc":[],
+                "test_loss":[], "test_acc":[], "precision":[], "recall":[], "f1":[]}
+
+    full_fold   = init_fold_metrics()
+    text_fold   = init_fold_metrics()
+    vision_fold = init_fold_metrics()
+    partial_fold= init_fold_metrics()
+    lora_fold   = init_fold_metrics()
+    peft_fold   = init_fold_metrics()
+    fractional_fold = init_fold_metrics()
+
+    timing = {"Full Fine-Tuning":[], "Text Encoder Fine-Tuning":[],
+              "Vision-Only Fine-Tuning":[], "Partial Fine-Tuning":[], "LoRA Adapters":[],
+              "PEFT LoRA": [], "Fractional (1-5%)": []}
+
+    params_info = []
+
+    ckpt_path = os.path.join(BASE_DIR, "checkpoint.json")
+    checkpoint = {"current_fold": 0, "completed_approaches": {}}
+    if os.path.exists(ckpt_path):
+        try:
+            with open(ckpt_path,"r") as f: checkpoint = json.load(f)
+            print(f"Resume from fold {checkpoint['current_fold']+1}")
+            for k in ["full_fold","text_fold","vision_fold","partial_fold","lora_fold","peft_fold","fractional_fold","timing"]:
+                if k in checkpoint:
+                    locals()[k] = checkpoint[k]
+        except Exception as e:
+            print("Checkpoint load failed:", e)
+
+    # Harden checkpoint compatibility
+    for k in ["Full Fine-Tuning","Text Encoder Fine-Tuning","Vision-Only Fine-Tuning",
+              "Partial Fine-Tuning","LoRA Adapters","PEFT LoRA","Fractional (1-5%)"]:
+        timing.setdefault(k, [])
+    def ensure_fold_dict(d):
+        for key in ["train_loss", "train_acc", "val_loss", "val_acc",
+                    "test_loss", "test_acc", "precision", "recall", "f1"]:
+            d.setdefault(key, [])
+        return d
+    full_fold   = ensure_fold_dict(full_fold)
+    text_fold   = ensure_fold_dict(text_fold)
+    vision_fold = ensure_fold_dict(vision_fold)
+    partial_fold= ensure_fold_dict(partial_fold)
+    lora_fold   = ensure_fold_dict(lora_fold)
+    peft_fold   = ensure_fold_dict(peft_fold)
+    fractional_fold = ensure_fold_dict(fractional_fold)
+
+    num_workers = min(8, os.cpu_count() or 0)
+    print("Workers (OpenCLIP):", num_workers)
+    num_workers_peft = 0  # Windows-safe for HF+PEFT
+    print("Workers (PEFT/HF):", num_workers_peft)
+
+    pin_mem = (device.type == "cuda")
+
+    for fold, (train_val_idx, test_idx) in enumerate(kf.split(dataset)):
+        if fold < checkpoint["current_fold"]:
+            print(f"Skip Fold {fold+1}"); continue
+
+        print(f"\n--- Fold {fold+1}/{k_folds} ---")
+        tv_size = len(train_val_idx); train_size = int(0.8 * tv_size)
+        train_idx = train_val_idx[:train_size]; val_idx = train_val_idx[train_size:]
+
+        train_subset = Subset(dataset, train_idx.tolist())
+        val_subset   = Subset(dataset, val_idx.tolist())
+        test_subset  = Subset(dataset, test_idx.tolist())
+
+        train_ds = FashionDataset(train_subset, subcategories, augment=True)
+        val_ds   = FashionDataset(val_subset,   subcategories)
+        test_ds  = FashionDataset(test_subset,  subcategories)
+
+        train_loader = DataLoader(train_ds, batch_size=32, shuffle=True,
+                                  num_workers=num_workers, pin_memory=pin_mem)
+        val_loader   = DataLoader(val_ds,   batch_size=32, shuffle=False,
+                                  num_workers=num_workers, pin_memory=pin_mem)
+        test_loader  = DataLoader(test_ds,  batch_size=32, shuffle=False,
+                                  num_workers=num_workers, pin_memory=pin_mem)
+
+        if str(fold) not in checkpoint["completed_approaches"]:
+            checkpoint["completed_approaches"][str(fold)] = []
+
+        # 1) Full FT
+        if "full" not in checkpoint["completed_approaches"][str(fold)]:
+            print("\n[1/7] Full Fine-Tuning")
+            start = time.time()
+            model = FullFineTunedCLIP(clip_model, len(subcategories), num_layers=1, freeze_encoder=False).to(device)
+            crit = nn.CrossEntropyLoss(weight=class_weights)
+            opt  = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
+            writer = get_tensorboard_writer(BASE_DIR, "Full Fine-Tuning", fold+1)
+
+            # param stats
+            total, trainable, pct = get_param_stats(model)
+            params_info.append({"Fold": fold+1, "Approach": "Full Fine-Tuning",
+                                "TotalParams": total, "TrainableParams": trainable, "TrainablePct": pct})
+
+            met = train_model_with_zero_clipping(
+                model, train_loader, val_loader, test_loader, crit, opt, 4,
+                subcategories, device, BASE_DIR, fold+1, 
+                accumulation_steps=4, validate_every=2, model_type="Full Fine-Tuning",
+                writer=writer, clip_value=0.0
+            )
+            
+            evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Full Fine-Tuning", "Validation", writer=writer)
+            evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Full Fine-Tuning", "Test", writer=writer)
+            writer.close()
+
+            best = os.path.join(BEST_DIR, f"best_full_fine-tuning_fold{fold+1}.pth")
+            if os.path.exists(best): model.load_state_dict(torch.load(best, map_location=device))
+            v = evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Full Fine-Tuning","Validation")
+            t = evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Full Fine-Tuning","Test")
+            full_fold["train_loss"].append(met["train_loss"][-1] if met["train_loss"] else 0)
+            full_fold["train_acc"].append(met["train_acc"][-1] if met["train_acc"] else 0)
+            full_fold["val_loss"].append(v[0]); full_fold["val_acc"].append(v[1])
+            full_fold["test_loss"].append(t[0]); full_fold["test_acc"].append(t[1])
+            full_fold["precision"].append(v[2]); full_fold["recall"].append(v[3]); full_fold["f1"].append(v[4])
+            save_logs_as_zip(writer.log_dir, f"full_finetune_fold_{fold+1}_logs", delete_after=False)
+            timing["Full Fine-Tuning"].append(time.time()-start)
+            checkpoint["completed_approaches"][str(fold)].append("full")
+            checkpoint["current_fold"]=fold; checkpoint["full_fold"]=full_fold; checkpoint["timing"]=timing
+            with open(ckpt_path,"w") as f: json.dump(checkpoint,f)
+
+        # 2) Text FT
+        if "text" not in checkpoint["completed_approaches"][str(fold)]:
+            print("\n[2/7] Text Encoder Fine-Tuning")
+            start=time.time()
+            model = TextEncoderFineTunedCLIP(clip_model, subcategories, device, freeze_visual=True).to(device)
+            crit = nn.CrossEntropyLoss(weight=class_weights)
+            opt  = optim.AdamW(model.text_encoder.parameters(), lr=1e-4)
+            writer = get_tensorboard_writer(BASE_DIR, "Text Encoder Fine-Tuning", fold+1)
+
+            total, trainable, pct = get_param_stats(model)
+            params_info.append({"Fold": fold+1, "Approach": "Text Encoder Fine-Tuning",
+                                "TotalParams": total, "TrainableParams": trainable, "TrainablePct": pct})
+
+            met = train_model_with_zero_clipping(
+                model, train_loader, val_loader, test_loader, crit, opt, 4,
+                subcategories, device, BASE_DIR, fold+1, 
+                accumulation_steps=4, validate_every=2, model_type="Text Encoder Fine-Tuning",
+                writer=writer, clip_value=0.0
+            )
+            
+            evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Text Encoder Fine-Tuning", "Validation", writer=writer)
+            evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Text Encoder Fine-Tuning", "Test", writer=writer)
+            writer.close()
+
+            best = os.path.join(BEST_DIR, f"best_text_encoder_fine-tuning_fold{fold+1}.pth")
+            if os.path.exists(best): model.load_state_dict(torch.load(best, map_location=device))
+            v = evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Text Encoder Fine-Tuning","Validation")
+            t = evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Text Encoder Fine-Tuning","Test")
+            text_fold["train_loss"].append(met["train_loss"][-1] if met["train_loss"] else 0)
+            text_fold["train_acc"].append(met["train_acc"][-1] if met["train_acc"] else 0)
+            text_fold["val_loss"].append(v[0]); text_fold["val_acc"].append(v[1])
+            text_fold["test_loss"].append(t[0]); text_fold["test_acc"].append(t[1])
+            text_fold["precision"].append(v[2]); text_fold["recall"].append(v[3]); text_fold["f1"].append(v[4])
+            save_logs_as_zip(writer.log_dir, f"text_finetune_fold_{fold+1}_logs", delete_after=False)
+            timing["Text Encoder Fine-Tuning"].append(time.time()-start)
+            checkpoint["completed_approaches"][str(fold)].append("text")
+            checkpoint["current_fold"]=fold; checkpoint["text_fold"]=text_fold; checkpoint["timing"]=timing
+            with open(ckpt_path,"w") as f: json.dump(checkpoint,f)
+
+        # 3) Vision-only FT
+        if "vision" not in checkpoint["completed_approaches"][str(fold)]:
+            print("\n[3/7] Vision-Only Fine-Tuning")
+            start=time.time()
+            model = VisionOnlyFineTunedCLIP(clip_model, len(subcategories), num_layers=1).to(device)
+            crit = nn.CrossEntropyLoss(weight=class_weights)
+            opt  = optim.AdamW(model.parameters(), lr=1e-4)
+            writer = get_tensorboard_writer(BASE_DIR, "Vision-Only Fine-Tuning", fold+1)
+
+            total, trainable, pct = get_param_stats(model)
+            params_info.append({"Fold": fold+1, "Approach": "Vision-Only Fine-Tuning",
+                                "TotalParams": total, "TrainableParams": trainable, "TrainablePct": pct})
+
+            met = train_model_with_zero_clipping(
+                model, train_loader, val_loader, test_loader, crit, opt, 4,
+                subcategories, device, BASE_DIR, fold+1, 
+                accumulation_steps=4, validate_every=2, model_type="Vision-Only Fine-Tuning",
+                writer=writer, clip_value=0.0
+            )
+            
+            evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Vision-Only Fine-Tuning", "Validation", writer=writer)
+            evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Vision-Only Fine-Tuning", "Test", writer=writer)
+            writer.close()
+
+            best = os.path.join(BEST_DIR, f"best_vision-only_fine-tuning_fold{fold+1}.pth")
+            if os.path.exists(best): model.load_state_dict(torch.load(best, map_location=device))
+            v = evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Vision-Only Fine-Tuning","Validation")
+            t = evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Vision-Only Fine-Tuning","Test")
+            vision_fold["train_loss"].append(met["train_loss"][-1] if met["train_loss"] else 0)
+            vision_fold["train_acc"].append(met["train_acc"][-1] if met["train_acc"] else 0)
+            vision_fold["val_loss"].append(v[0]); vision_fold["val_acc"].append(v[1])
+            vision_fold["test_loss"].append(t[0]); vision_fold["test_acc"].append(t[1])
+            vision_fold["precision"].append(v[2]); vision_fold["recall"].append(v[3]); vision_fold["f1"].append(v[4])
+            save_logs_as_zip(writer.log_dir, f"vision_finetune_fold_{fold+1}_logs", delete_after=False)
+            timing["Vision-Only Fine-Tuning"].append(time.time()-start)
+            checkpoint["completed_approaches"][str(fold)].append("vision")
+            checkpoint["current_fold"]=fold; checkpoint["vision_fold"]=vision_fold; checkpoint["timing"]=timing
+            with open(ckpt_path,"w") as f: json.dump(checkpoint,f)
+
+        # 4) Partial FT
+        if "partial" not in checkpoint["completed_approaches"][str(fold)]:
+            print("\n[4/7] Partial Fine-Tuning (last 30% both encoders)")
+            start=time.time()
+            model = PartialFineTunedCLIP(clip_model, len(subcategories), freeze_percentage=0.7).to(device)
+            crit = nn.CrossEntropyLoss(weight=class_weights)
+            params = [p for p in model.parameters() if p.requires_grad]
+            opt  = optim.AdamW(params, lr=1e-4)
+            writer = get_tensorboard_writer(BASE_DIR, "Partial Fine-Tuning", fold+1)
+
+            total, trainable, pct = get_param_stats(model)
+            params_info.append({"Fold": fold+1, "Approach": "Partial Fine-Tuning",
+                                "TotalParams": total, "TrainableParams": trainable, "TrainablePct": pct})
+
+            met = train_model_with_zero_clipping(
+                model, train_loader, val_loader, test_loader, crit, opt, 4,
+                subcategories, device, BASE_DIR, fold+1, 
+                accumulation_steps=4, validate_every=2, model_type="Partial Fine-Tuning",
+                writer=writer, clip_value=0.0
+            )
+            
+            evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Partial Fine-Tuning", "Validation", writer=writer)
+            evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Partial Fine-Tuning", "Test", writer=writer)
+            writer.close()
+
+            best = os.path.join(BEST_DIR, f"best_partial_fine-tuning_fold{fold+1}.pth")
+            if os.path.exists(best): model.load_state_dict(torch.load(best, map_location=device))
+            v = evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Partial Fine-Tuning","Validation")
+            t = evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Partial Fine-Tuning","Test")
+            partial_fold["train_loss"].append(met["train_loss"][-1] if met["train_loss"] else 0)
+            partial_fold["train_acc"].append(met["train_acc"][-1] if met["train_acc"] else 0)
+            partial_fold["val_loss"].append(v[0]); partial_fold["val_acc"].append(v[1])
+            partial_fold["test_loss"].append(t[0]); partial_fold["test_acc"].append(t[1])
+            partial_fold["precision"].append(v[2]); partial_fold["recall"].append(v[3]); partial_fold["f1"].append(v[4])
+            save_logs_as_zip(writer.log_dir, f"partial_finetune_fold_{fold+1}_logs", delete_after=False)
+            timing["Partial Fine-Tuning"].append(time.time()-start)
+            checkpoint["completed_approaches"][str(fold)].append("partial")
+            checkpoint["current_fold"]=fold; checkpoint["partial_fold"]=partial_fold; checkpoint["timing"]=timing
+            with open(ckpt_path,"w") as f: json.dump(checkpoint,f)
+
+        # 5) Custom LoRA (OpenCLIP)
+        if "lora" not in checkpoint["completed_approaches"][str(fold)]:
+            print("\n[5/7] LoRA Adapters (custom; both encoders) ...")
+            start=time.time()
+            model = LoRAClipBothEncoders(clip_model, subcategories, device,
+                                         lora_r=8, lora_alpha=16, lora_dropout=0.05).to(device)
+            crit = nn.CrossEntropyLoss(weight=class_weights)
+            params = [p for p in model.parameters() if p.requires_grad]
+            opt  = optim.AdamW(params, lr=2e-4)
+            writer = get_tensorboard_writer(BASE_DIR, "LoRA Adapters", fold+1)
+
+            total, trainable, pct = get_param_stats(model)
+            params_info.append({"Fold": fold+1, "Approach": "LoRA Adapters",
+                                "TotalParams": total, "TrainableParams": trainable, "TrainablePct": pct})
+
+            met = train_model_with_zero_clipping(
+                model, train_loader, val_loader, test_loader, crit, opt, 4,
+                subcategories, device, BASE_DIR, fold+1, 
+                accumulation_steps=4, validate_every=2, model_type="LoRA Adapters",
+                writer=writer, clip_value=0.0
+            )
+            
+            evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "LoRA Adapters", "Validation", writer=writer)
+            evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "LoRA Adapters", "Test", writer=writer)
+            writer.close()
+
+            best = os.path.join(BEST_DIR, f"best_lora_adapters_fold{fold+1}.pth")
+            if os.path.exists(best): model.load_state_dict(torch.load(best, map_location=device))
+            v = evaluate_model_with_metrics(model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "LoRA Adapters","Validation")
+            t = evaluate_model_with_metrics(model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "LoRA Adapters","Test")
+            lora_fold["train_loss"].append(met["train_loss"][-1] if met["train_loss"] else 0)
+            lora_fold["train_acc"].append(met["train_acc"][-1] if met["train_acc"] else 0)
+            lora_fold["val_loss"].append(v[0]); lora_fold["val_acc"].append(v[1])
+            lora_fold["test_loss"].append(t[0]); lora_fold["test_acc"].append(t[1])
+            lora_fold["precision"].append(v[2]); lora_fold["recall"].append(v[3]); lora_fold["f1"].append(v[4])
+            save_logs_as_zip(writer.log_dir, f"lora_finetune_fold_{fold+1}_logs", delete_after=False)
+            timing["LoRA Adapters"].append(time.time()-start)
+            checkpoint["completed_approaches"][str(fold)].append("lora")
+            checkpoint["current_fold"]=fold; checkpoint["lora_fold"]=lora_fold; checkpoint["timing"]=timing
+            with open(ckpt_path,"w") as f: json.dump(checkpoint,f)
+
+        # 6) HF PEFT LoRA (text only; forward bypass)
+        if "peft" not in checkpoint["completed_approaches"][str(fold)]:
+            print("\n[6/7] PEFT LoRA (HF transformers CLIP, text-only) ...")
+            start=time.time()
+
+            train_raw = FashionRawPILDataset(train_subset, subcategories)
+            val_raw   = FashionRawPILDataset(val_subset,   subcategories)
+            test_raw  = FashionRawPILDataset(test_subset,  subcategories)
+
+            peft_model = HfCLIPWithPEFT(
+                model_name="openai/clip-vit-base-patch32",
+                device=device,
+                subcategories=subcategories,
+                lora_r=8, lora_alpha=16, lora_dropout=0.05,
+                freeze_non_lora=True,
+                lora_on_vision=False
+            ).to(device)
+
+            peft_collate = CollateCLIP(peft_model.processor)
+            train_loader_peft = DataLoader(train_raw, batch_size=32, shuffle=True,
+                                           num_workers=num_workers_peft, pin_memory=pin_mem, collate_fn=peft_collate)
+            val_loader_peft   = DataLoader(val_raw,   batch_size=32, shuffle=False,
+                                           num_workers=num_workers_peft, pin_memory=pin_mem, collate_fn=peft_collate)
+            test_loader_peft  = DataLoader(test_raw,  batch_size=32, shuffle=False,
+                                           num_workers=num_workers_peft, pin_memory=pin_mem, collate_fn=peft_collate)
+
+            crit = nn.CrossEntropyLoss(weight=class_weights)
+            params = [p for p in peft_model.parameters() if p.requires_grad]
+            opt  = optim.AdamW(params, lr=2e-4)
+            writer = get_tensorboard_writer(BASE_DIR, "PEFT LoRA", fold+1)
+
+            total, trainable, pct = get_param_stats(peft_model)
+            params_info.append({"Fold": fold+1, "Approach": "PEFT LoRA",
+                                "TotalParams": total, "TrainableParams": trainable, "TrainablePct": pct})
+
+            met = train_model_with_zero_clipping(
+                peft_model, train_loader_peft, val_loader_peft, test_loader_peft, crit, opt, 4,
+                subcategories, device, BASE_DIR, fold+1,
+                accumulation_steps=4, validate_every=1, model_type="PEFT LoRA",
+                writer=writer, clip_value=0.0
+            )
+            
+            evaluate_model_with_metrics(peft_model, val_loader_peft, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "PEFT LoRA","Validation", writer=writer)
+            evaluate_model_with_metrics(peft_model, test_loader_peft, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "PEFT LoRA","Test", writer=writer)
+            writer.close()
+
+            best = os.path.join(BEST_DIR, f"best_peft_lora_fold{fold+1}.pth")
+            if os.path.exists(best): peft_model.load_state_dict(torch.load(best, map_location=device))
+            v = evaluate_model_with_metrics(peft_model, val_loader_peft, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "PEFT LoRA","Validation")
+            t = evaluate_model_with_metrics(peft_model, test_loader_peft, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "PEFT LoRA","Test")
+
+            peft_fold["train_loss"].append(met["train_loss"][-1] if met["train_loss"] else 0)
+            peft_fold["train_acc"].append(met["train_acc"][-1] if met["train_acc"] else 0)
+            peft_fold["val_loss"].append(v[0]); peft_fold["val_acc"].append(v[1])
+            peft_fold["test_loss"].append(t[0]); peft_fold["test_acc"].append(t[1])
+            peft_fold["precision"].append(v[2]); peft_fold["recall"].append(v[3]); peft_fold["f1"].append(v[4])
+
+            save_logs_as_zip(writer.log_dir, f"peft_lora_fold_{fold+1}_logs", delete_after=False)
+            timing["PEFT LoRA"].append(time.time()-start)
+            checkpoint["completed_approaches"][str(fold)].append("peft")
+            checkpoint["current_fold"]=fold; checkpoint["peft_fold"]=peft_fold; checkpoint["timing"]=timing
+            with open(ckpt_path,"w") as f: json.dump(checkpoint,f)
+
+        # 7) Fractional FT (1–5%)
+        if "fractional" not in checkpoint["completed_approaches"][str(fold)]:
+            print("\n[7/7] Fractional (1–5%) — train tiny slice of vision tower")
+            start=time.time()
+
+            # Use a fresh base to avoid interference with earlier injections
+            fresh_clip, _, _ = load_clip_model(device, "ViT-B-32", "openai")
+            frac_model = FractionalFT_VisionCLIP(fresh_clip, len(subcategories), min_frac=0.01, max_frac=0.05).to(device)
+
+            crit = nn.CrossEntropyLoss(weight=class_weights)
+            params = [p for p in frac_model.parameters() if p.requires_grad]
+            opt  = optim.AdamW(params, lr=1e-4, weight_decay=1e-4)
+            writer = get_tensorboard_writer(BASE_DIR, "Fractional (1-5%)", fold+1)
+
+            total, trainable, pct = get_param_stats(frac_model)
+            params_info.append({"Fold": fold+1, "Approach": "Fractional (1-5%)",
+                                "TotalParams": total, "TrainableParams": trainable, "TrainablePct": pct})
+
+            met = train_model_with_zero_clipping(
+                frac_model, train_loader, val_loader, test_loader, crit, opt, 4,
+                subcategories, device, BASE_DIR, fold+1, 
+                accumulation_steps=4, validate_every=2, model_type="Fractional (1-5%)",
+                writer=writer, clip_value=0.0
+            )
+            
+            evaluate_model_with_metrics(frac_model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Fractional (1-5%)","Validation", writer=writer)
+            evaluate_model_with_metrics(frac_model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                        "Fractional (1-5%)","Test", writer=writer)
+            writer.close()
+
+            best = os.path.join(BEST_DIR, f"best_fractional_(1-5%)_fold{fold+1}.pth")
+            if os.path.exists(best): frac_model.load_state_dict(torch.load(best, map_location=device))
+            v = evaluate_model_with_metrics(frac_model, val_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Fractional (1-5%)","Validation")
+            t = evaluate_model_with_metrics(frac_model, test_loader, crit, subcategories, device, fold+1, FINAL_EPOCH_TAG,
+                                            "Fractional (1-5%)","Test")
+            fractional_fold["train_loss"].append(met["train_loss"][-1] if met["train_loss"] else 0)
+            fractional_fold["train_acc"].append(met["train_acc"][-1] if met["train_acc"] else 0)
+            fractional_fold["val_loss"].append(v[0]); fractional_fold["val_acc"].append(v[1])
+            fractional_fold["test_loss"].append(t[0]); fractional_fold["test_acc"].append(t[1])
+            fractional_fold["precision"].append(v[2]); fractional_fold["recall"].append(v[3]); fractional_fold["f1"].append(v[4])
+
+            save_logs_as_zip(writer.log_dir, f"fractional_finetune_fold_{fold+1}_logs", delete_after=False)
+            timing["Fractional (1-5%)"].append(time.time()-start)
+            checkpoint["completed_approaches"][str(fold)].append("fractional")
+            checkpoint["current_fold"]=fold; checkpoint["fractional_fold"]=fractional_fold; checkpoint["timing"]=timing
+            with open(ckpt_path,"w") as f: json.dump(checkpoint,f)
+
+    # Final comparison logging
+    comparison_writer = get_tensorboard_writer(BASE_DIR, "Comparisons", 0)
+    log_comparison_metrics(
+        comparison_writer,
+        ["Full", "Text", "Vision", "Partial", "LoRA", "PEFT", "Fractional"],
+        [full_fold, text_fold, vision_fold, partial_fold, lora_fold, peft_fold, fractional_fold],
+        k_folds
+    )
+    comparison_writer.close()
+
+    # Save all metrics
+    def dump(name, d): save_csv(d, f"{name}.csv")
+    dump("kfold_full_finetune_metrics",    full_fold)
+    dump("kfold_text_encoder_metrics",     text_fold)
+    dump("kfold_vision_only_metrics",      vision_fold)
+    dump("kfold_partial_finetune_metrics", partial_fold)
+    dump("kfold_lora_adapters_metrics",    lora_fold)
+    dump("kfold_peft_lora_metrics",        peft_fold)
+    dump("kfold_fractional_metrics",       fractional_fold)
+
+    # Timing CSV
+    timing_rows=[]
+    for approach, durations in timing.items():
+        if durations:
+            for i, dur in enumerate(durations, 1):
+                h, rem = divmod(dur,3600); m, s = divmod(rem,60)
+                timing_rows.append({"Approach":approach,"Fold":i,"Duration (seconds)":dur,
+                                    "Formatted Duration":f"{int(h):02d}:{int(m):02d}:{int(s):02d}"})
+        else:
+            for i in range(1, k_folds+1):
+                timing_rows.append({"Approach":approach,"Fold":i,"Duration (seconds)":0,"Formatted Duration":"N/A"})
+    save_csv(pd.DataFrame(timing_rows), "execution_timing.csv")
+
+    # Param stats CSV
+    save_csv(pd.DataFrame(params_info), "params_info.csv")
+
+    overall_end = time.time()
+    h, rem = divmod(overall_end-overall_start,3600); m, s = divmod(rem,60)
+    print(f"\nFinished: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(overall_end))}")
+    print(f"Total Duration: {int(h):02d}:{int(m):02d}:{int(s):02d}")
