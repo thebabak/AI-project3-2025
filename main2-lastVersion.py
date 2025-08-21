@@ -13,6 +13,7 @@ import seaborn as sns
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
@@ -110,14 +111,14 @@ class CustomCLIPFineTuner(nn.Module):
             if any(k in name.lower() for k in ["ln_post", "proj", "attn", "mlp", "resblocks.11", "resblocks.10"]):
                 p.requires_grad = True
         # Probe output dim
-        dev = next(base_model.parameters()).device
+        dev = next(self.visual_encoder.parameters()).device
         dummy = torch.randn(1, 3, 224, 224, device=dev)
         with torch.no_grad():
             out_dim = self.visual_encoder(dummy).shape[1]
         # Simple classifier head
         layers = []
         in_dim = out_dim
-        for i in range(num_layers - 1):
+        for _ in range(num_layers - 1):
             layers += [nn.Linear(in_dim, in_dim), nn.ReLU(), nn.Dropout(0.2)]
         layers += [nn.Linear(in_dim, num_classes)]
         self.classifier = nn.Sequential(*layers)
@@ -132,7 +133,7 @@ class NonFineTunedCLIP(nn.Module):
         self.visual_encoder = base_model.visual
         for p in self.visual_encoder.parameters():
             p.requires_grad = False
-        dev = next(base_model.parameters()).device
+        dev = next(self.visual_encoder.parameters()).device
         dummy = torch.randn(1, 3, 224, 224, device=dev)
         with torch.no_grad():
             out_dim = self.visual_encoder(dummy).shape[1]
@@ -224,6 +225,116 @@ def tf_log_figure(tf_writer, tag, fig, step):
         tf.summary.image(tag, image, step=step)
 
 # -----------------------------
+# Cosine Similarity (class centroids)
+# -----------------------------
+@torch.no_grad()
+def compute_and_log_similarity_matrix(
+    model,
+    loader: DataLoader,
+    subcategories,
+    device: torch.device,
+    artifacts_png_dir: str,
+    artifacts_csv_dir: str,
+    tag_prefix: str,
+    fold_index: int,
+    tb_writer: SummaryWriter = None,
+    tf_writer=None,
+    global_step: int = None,
+):
+    """
+    Computes class centroids from the model's visual encoder on the loader,
+    builds a cosine similarity matrix (classes x classes), writes CSV & PNG,
+    and logs to TensorBoard (PyTorch + TF).
+    """
+    model.eval()
+    num_classes = len(subcategories)
+
+    feat_sums = None
+    counts = None
+    D = None
+
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        feats = model.visual_encoder(images)  # (B, D)
+        feats = F.normalize(feats, dim=1)     # normalize for cosine
+
+        if D is None:
+            D = feats.size(1)
+            feat_sums = torch.zeros(num_classes, D, device=device)
+            counts = torch.zeros(num_classes, device=device)
+
+        # accumulate per class
+        for c in labels.unique().tolist():
+            mask = (labels == c)
+            feat_sums[c] += feats[mask].sum(dim=0)
+            counts[c] += mask.sum()
+
+    # avoid div by zero
+    counts = counts.clamp(min=1.0).unsqueeze(1)  # (C,1)
+    centroids = feat_sums / counts               # (C,D)
+    centroids = F.normalize(centroids, dim=1)
+
+    # cosine similarity between class centroids
+    sim = centroids @ centroids.t()              # (C,C)
+    sim_np = sim.detach().cpu().numpy()
+
+    # ----- Save CSV -----
+    df = pd.DataFrame(sim_np, index=subcategories, columns=subcategories)
+    safe_tag = tag_prefix.replace("/", "_")
+    os.makedirs(artifacts_csv_dir, exist_ok=True)
+    csv_path = os.path.join(
+        artifacts_csv_dir, f"similarity_{safe_tag}_fold{fold_index}.csv"
+    )
+    df.to_csv(csv_path, float_format="%.6f")
+    print(f"Saved similarity CSV: {csv_path}")
+
+    # ----- Save PNG -----
+    os.makedirs(artifacts_png_dir, exist_ok=True)
+    fig = plt.figure(figsize=(12, 10))
+    ax = sns.heatmap(
+        df, cmap="vlag", center=0.0, vmin=-1.0, vmax=1.0,
+        xticklabels=True, yticklabels=True
+    )
+    plt.title(f"Cosine Similarity — {tag_prefix} — Fold {fold_index}")
+    plt.xlabel("Class")
+    plt.ylabel("Class")
+    fig.tight_layout()
+    png_path = os.path.join(
+        artifacts_png_dir, f"similarity_{safe_tag}_fold{fold_index}.png"
+    )
+    plt.savefig(png_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved similarity PNG: {png_path}")
+
+    # ----- TensorBoard logging -----
+    if tb_writer is not None:
+        # Recreate the figure for TB to avoid "closed figure" issues
+        fig_tb = plt.figure(figsize=(12, 10))
+        sns.heatmap(df, cmap="vlag", center=0.0, vmin=-1.0, vmax=1.0,
+                    xticklabels=True, yticklabels=True)
+        plt.title(f"Cosine Similarity — {tag_prefix} — Fold {fold_index}")
+        plt.xlabel("Class")
+        plt.ylabel("Class")
+        fig_tb.tight_layout()
+        step = 0 if global_step is None else global_step
+        tb_writer.add_figure(f"{tag_prefix}/CosineSimilarity", fig_tb, global_step=step)
+        plt.close(fig_tb)
+
+    if TF_AVAILABLE and tf_writer is not None:
+        # Recreate once more for TF
+        fig_tf = plt.figure(figsize=(12, 10))
+        sns.heatmap(df, cmap="vlag", center=0.0, vmin=-1.0, vmax=1.0,
+                    xticklabels=True, yticklabels=True)
+        plt.title(f"Cosine Similarity — {tag_prefix} — Fold {fold_index}")
+        plt.xlabel("Class")
+        plt.ylabel("Class")
+        fig_tf.tight_layout()
+        step = 0 if global_step is None else global_step
+        tf_log_figure(tf_writer, f"{tag_prefix}/CosineSimilarity", fig_tf, step=step)
+
+# -----------------------------
 # Checkpointing
 # -----------------------------
 def save_checkpoint(state, ckpt_path):
@@ -291,7 +402,8 @@ def evaluate_model_with_metrics(model, loader, criterion, subcategories, device,
 def train_model_with_logging(model, train_loader, val_loader, optimizer_type, model_type,
                              subcategories, class_weights, device,
                              num_epochs=3, lr=1e-4, base_log_dir="logs/part2-5-4/", fold_index=0,
-                             resume=True):
+                             resume=True,
+                             artifacts_png_dir=None, artifacts_csv_dir=None):
     # Dirs
     run_dir = os.path.join(base_log_dir, f"{model_type}_{optimizer_type}_fold_{fold_index}")
     tb_torch_dir = os.path.join(run_dir, "tb_torch")
@@ -359,7 +471,10 @@ def train_model_with_logging(model, train_loader, val_loader, optimizer_type, mo
             preds = outputs.argmax(dim=1)
             total += labels.size(0)
             correct += (preds == labels).sum().item()
-            pbar.set_postfix({"loss": f"{running_loss / (pbar.n + 1):.4f}", "acc": f"{(100.0*correct/max(total,1)):.2f}"})
+            # approximate batch-wise display
+            processed_batches = max(1, pbar.n)
+            pbar.set_postfix({"loss": f"{running_loss / processed_batches:.4f}",
+                              "acc": f"{(100.0*correct/max(total,1)):.2f}"})
 
         train_loss = running_loss / max(len(train_loader), 1)
         train_acc = 100.0 * correct / max(total, 1)
@@ -432,6 +547,24 @@ def train_model_with_logging(model, train_loader, val_loader, optimizer_type, mo
         if early.stop:
             print("Early stopping triggered.")
             break
+
+    # ---- NEW: Similarity matrix (computed on the validation split) ----
+    try:
+        compute_and_log_similarity_matrix(
+            model=model,
+            loader=val_loader,
+            subcategories=subcategories,
+            device=device,
+            artifacts_png_dir=artifacts_png_dir or os.path.join(base_log_dir, "png"),
+            artifacts_csv_dir=artifacts_csv_dir or os.path.join(base_log_dir, "csv"),
+            tag_prefix=f"{model_type}/{optimizer_type}",
+            fold_index=fold_index,
+            tb_writer=tb_writer,
+            tf_writer=tf_writer,
+            global_step=history[-1]["epoch"] if len(history) else 0,
+        )
+    except Exception as e:
+        print("Similarity matrix computation failed:", e)
 
     tb_writer.close()
     if TF_AVAILABLE and tf_writer is not None:
@@ -554,7 +687,8 @@ if __name__ == "__main__":
             hist_ft, best_ckpt_ft = train_model_with_logging(
                 fine_model, train_loader, val_loader, optimizer_type=optimizer_type, model_type="fine_tuned",
                 subcategories=subcategories, class_weights=class_weights, device=device,
-                num_epochs=3, lr=1e-4, base_log_dir=base_log, fold_index=fold_index, resume=True
+                num_epochs=3, lr=1e-4, base_log_dir=base_log, fold_index=fold_index, resume=True,
+                artifacts_png_dir=png_dir, artifacts_csv_dir=csv_dir
             )
             last = hist_ft[-1] if hist_ft else {"val_loss": np.nan, "precision": np.nan, "recall": np.nan, "f1": np.nan}
             metrics[f"{optimizer_type}_fine_tuned"]["val_loss"].append(last["val_loss"])
@@ -568,7 +702,8 @@ if __name__ == "__main__":
             hist_nft, best_ckpt_nft = train_model_with_logging(
                 non_model, train_loader, val_loader, optimizer_type=optimizer_type, model_type="non_fine_tuned",
                 subcategories=subcategories, class_weights=class_weights, device=device,
-                num_epochs=3, lr=1e-4, base_log_dir=base_log, fold_index=fold_index, resume=True
+                num_epochs=3, lr=1e-4, base_log_dir=base_log, fold_index=fold_index, resume=True,
+                artifacts_png_dir=png_dir, artifacts_csv_dir=csv_dir
             )
             last = hist_nft[-1] if hist_nft else {"val_loss": np.nan, "precision": np.nan, "recall": np.nan, "f1": np.nan}
             metrics[f"{optimizer_type}_non_fine_tuned"]["val_loss"].append(last["val_loss"])
